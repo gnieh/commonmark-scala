@@ -26,7 +26,7 @@ trait Inlines {
 
   private val escapable = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
 
-  def parseBackslash(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseBackslash(input: Input, block: Seq[Inline]): Seq[Inline] = {
     input.accept('\\')
     input.peek match {
       case Some('\r') | Some('\n') =>
@@ -45,7 +45,7 @@ trait Inlines {
 
   private val entity = "(#x[a-f0-9]{1,8}|#[0-9]{1,8}|[a-z][a-z0-9]{1,31});".r
 
-  def parseAmp(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseAmp(input: Input, block: Seq[Inline]): Seq[Inline] = {
     input.accept('&')
     if (input.satisfy(entity)) {
       val raw = input.accept(entity, group = 1)
@@ -67,7 +67,7 @@ trait Inlines {
 
   private val backticks = "(?<!`)`+(?!`)".r
 
-  def parseBacktick(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseBacktick(input: Input, block: Seq[Inline]): Seq[Inline] = {
     val opener = input.accept(backticks)
     input.consumeTill(f"(?<!`)$opener(?!`)".r, true) match {
       case Some(code) =>
@@ -111,7 +111,7 @@ trait Inlines {
     f"$openTag|$closingTag|$comment|$pi|$decl|$cdata".r
   }
 
-  def parseLt(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseLt(input: Input, block: Seq[Inline]): Seq[Inline] = {
     input.accept('<')
     if (input.satisfy(email)) {
       // this is an email
@@ -135,7 +135,7 @@ trait Inlines {
 
   private val lineEnding = "(?:\r\n|\r|\n) *".r
 
-  def parseSpace(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseSpace(input: Input, block: Seq[Inline]): Seq[Inline] = {
     val spaces = input.accept(" +".r)
     val isLineEnd = input.satisfy(lineEnding)
     if (spaces.size >= 2 && isLineEnd) {
@@ -152,7 +152,7 @@ trait Inlines {
     }
   }
 
-  def parseNewLine(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseNewLine(input: Input, block: Seq[Inline]): Seq[Inline] = {
     input.accept(lineEnding)
     block.append(SoftBreak)
   }
@@ -165,47 +165,54 @@ trait Inlines {
 
   private sealed trait Delimiter {
     def deactivate: Delimiter
-    def inlines: Seq[Inline]
   }
-  private case class EmphDelimiter(char: Char, length: Int, canOpen: Boolean, canClose: Boolean) extends Delimiter {
+  private case class EmphToken(char: Char, length: Int, canOpen: Boolean, canClose: Boolean, node: Text) extends Delimiter {
     val deactivate = this
-    def inlines = Seq(Text(char.toString * length))
   }
-  private case class LinkOpener(isImage: Boolean, active: Boolean, inlines: Seq[Inline]) extends Delimiter {
+  private case class LinkOpener(isImage: Boolean, active: Boolean, node: Text) extends Delimiter {
     def deactivate = copy(active = isImage)
   }
 
-  private case class DelimiterStack(delimiter: Delimiter) {
+  private sealed trait DelimiterStack {
+    def append(d: Delimiter): DelimiterStack
+  }
+  private case class DelimiterStackNode(delimiter: Delimiter) extends DelimiterStack {
     private var previous: Option[DelimiterStack] = None
     private var next: Option[DelimiterStack] = None
 
     def append(d: Delimiter): DelimiterStack = {
-      val n = DelimiterStack(d)
+      val n = DelimiterStackNode(d)
       next = Some(n)
       n.previous = Some(this)
       n
     }
 
   }
+  private case object EmptyDelimiterStack extends DelimiterStack {
+    def append(d: Delimiter): DelimiterStack =
+      DelimiterStackNode(d)
+  }
 
-  def parseBang(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseBang(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
     input.accept('!')
     input.peek match {
       case Some('[') =>
         // this is probably an image, try to parse it
-        parseDelimiters(input, block, DelimiterStack(LinkOpener(true, true, Seq(Text("![")))))
+        val node = Text("![")
+        (block :+ node, stack.append(LinkOpener(true, true, node)))
       case Some(_) | None =>
         // ok, just a bang
-        block.append(Text("!"))
+        (block.append(Text("!")), stack)
     }
   }
 
-  def parseBracket(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseOpeningBracket(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
     input.accept('[')
-    parseDelimiters(input, block, DelimiterStack(LinkOpener(false, true, Seq(Text("[")))))
+    val node = Text("[")
+    (block :+ node, stack.append(LinkOpener(false, true, node)))
   }
 
-  def parseStar(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseStar(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
     val prev = input.previous
     val delim = input.accept("\\*+".r)
     val next = input.peek
@@ -220,10 +227,12 @@ trait Inlines {
 
     val canOpen = leftFlanking
     val canClose = rightFlanking
-    parseDelimiters(input, block, DelimiterStack(EmphDelimiter('*', delim.size, canOpen, canClose)))
+
+    val node = Text(delim)
+    (block :+ node, stack.append(EmphToken('*', delim.size, canOpen, canClose, node)))
   }
 
-  def parseUnderscore(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  private def parseUnderscore(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
     val prev = input.previous
     val delim = input.accept("_+".r)
     val next = input.peek
@@ -238,61 +247,58 @@ trait Inlines {
 
     val canOpen = leftFlanking && (!rightFlanking || prevIsPunctuation)
     val canClose = rightFlanking && (!leftFlanking || nextIsPunctuation)
-    parseDelimiters(input, block, DelimiterStack(EmphDelimiter('_', delim.size, canOpen, canClose)))
+
+    val node = Text(delim)
+    (block :+ node, stack.append(EmphToken('_', delim.size, canOpen, canClose, node)))
   }
 
-  def parseDelimiters(input: Input, block: Seq[Inline], stack: DelimiterStack): Seq[Inline] = {
-    input.peek match {
-      case Some(']') =>
-        lookForLinkOrImage(input: Input, block: Seq[Inline], stack: DelimiterStack)
-    }
-  }
-
-  def lookForLinkOrImage(input: Input, block: Seq[Inline], stack: DelimiterStack): Seq[Inline] = {
-
+  private def lookForLinkOrImage(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
+    // look for active link opener in the stack
     ???
   }
 
   // entry point
 
-  private val text = "[^ \r\n`\\[\\!<&*_]+".r
+  private val text = "[^ \r\n`\\[\\]\\!<&*_]+".r
 
-  def parseInline(input: Input, block: Seq[Inline]): Option[Seq[Inline]] =
+  private def parseInline(input: Input, block: Seq[Inline], stack: DelimiterStack): Option[(Seq[Inline], DelimiterStack)] =
     input.peek.map {
       case '\\' =>
-        parseBackslash(input, block)
+        parseBackslash(input, block) -> stack
       case '&' =>
-        parseAmp(input, block)
+        parseAmp(input, block) -> stack
       case '`' =>
-        parseBacktick(input, block)
+        parseBacktick(input, block) -> stack
       case '<' =>
-        parseLt(input, block)
+        parseLt(input, block) -> stack
       case ' ' =>
-        parseSpace(input, block)
+        parseSpace(input, block) -> stack
       case '\r' | '\n' =>
-        parseNewLine(input, block)
+        parseNewLine(input, block) -> stack
       case '!' =>
-        parseBang(input, block)
+        parseBang(input, block, stack)
       case '[' =>
-        parseBracket(input, block)
+        parseOpeningBracket(input, block, stack)
+      case ']' =>
+        lookForLinkOrImage(input, block, stack)
       case '*' =>
-        parseStar(input, block)
+        parseStar(input, block, stack)
       case '_' =>
-        parseUnderscore(input, block)
+        parseUnderscore(input, block, stack)
       case _ =>
         // consume normal text
         val txt = input.accept(text)
-        block.append(Text(txt))
+        block.append(Text(txt)) -> stack
     }
 
   def parseInlines(input: Input, block: Seq[Inline]): Seq[Inline] = {
     @tailrec
-    def loop(block: Seq[Inline]): Seq[Inline] =
-      parseInline(input, block) match {
-        case Some(block) => loop(block)
-        case None        => block
+    def loop(block: Seq[Inline], stack: DelimiterStack): Seq[Inline] =
+      parseInline(input, block, stack) match {
+        case Some((block, stack)) => loop(block, stack)
+        case None                 => block
       }
-    loop(block)
+    loop(block, EmptyDelimiterStack)
   }
 
 }
