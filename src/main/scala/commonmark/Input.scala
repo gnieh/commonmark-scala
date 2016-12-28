@@ -21,6 +21,12 @@ import scala.util.matching.Regex
  *  character and its context, as well as methods
  *  to move forward in this input. No backtracking is
  *  possible once a character was consumed.
+ *
+ *  It is possible to create local buffer of the input starting at the current position,
+ *  allowing to either commit or rollback the consumed input.
+ *  It is handy when it is not easy to determine a priori whether
+ *  the current input matches a construct using a regular expression.
+ *  However be careful, for stream input, the more you buffer data, the more memory is potentially used.
  */
 trait Input {
 
@@ -40,7 +46,13 @@ trait Input {
    *
    *  @group Consuming
    */
-  def next(): Unit
+  def next(): Char
+
+  /** Indicates whehter there is further characters in the input at the current position.
+   *
+   *  @group NonConsuming
+   */
+  def hasNext: Boolean
 
   /* Checks that the current character is the given one
    * and consumes it.
@@ -75,4 +87,22 @@ trait Input {
    */
   def consumeTill(re: Regex, inclusive: Boolean): Option[String]
 
+  def buffered[T](f: => Action[T]): Option[T]
+
 }
+
+/** An action to execute at the end of a buffered tratement.
+ *  Either commit or rollback.
+ */
+sealed trait Action[+T]
+object Action {
+
+  def apply[T](o: Option[T]): Action[T] =
+    o match {
+      case Some(v) => Commit(v)
+      case None    => Rollback
+    }
+
+}
+final case class Commit[T](value: T) extends Action[T]
+case object Rollback extends Action[Nothing]

@@ -18,13 +18,22 @@ import ast._
 
 import org.unbescape.html.HtmlEscape
 
+import java.net.{
+  URLEncoder,
+  URLDecoder
+}
+import java.text.Normalizer
+import java.util.Locale
+
 import scala.annotation.tailrec
 
 trait Inlines {
 
   // backslash escapes
 
-  private val escapable = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+  private val escapable = """[!"#$%&'()*+,\-./:;<=>?@\[\]\^_`{|}~]"""
+
+  private val escaped = escapable.r
 
   private def parseBackslash(input: Input, block: Seq[Inline]): Seq[Inline] = {
     input.accept('\\')
@@ -32,12 +41,12 @@ trait Inlines {
       case Some('\r') | Some('\n') =>
         // hard break, consume it and following leading spaces
         input.accept("""(\r\n|\r|\n) *""".r)
-        block.append(Hardbreak)
-      case Some(c) if escapable.contains(c) =>
-        input.next()
-        block.append(Text(c))
+        block :+ Hardbreak
+      case Some(c) if input.satisfy(escaped) =>
+        val esc = input.accept(escaped)
+        block :+ Text(esc)
       case _ =>
-        block.append(Text('\\'))
+        block :+ Text("\\")
     }
   }
 
@@ -53,13 +62,13 @@ trait Inlines {
       if (raw == unescaped) {
         // not an entity
         // escape the '&' and add the rest as is
-        block.append(Text(HtmlEscape.escapeHtml5(raw)))
+        block :+ Text(HtmlEscape.escapeHtml5(raw))
       } else {
-        block.append(Text(unescaped))
+        block :+ Text(unescaped)
       }
     } else {
       // just return the raw '&'
-      block.append(Text('&'))
+      block :+ Text('&')
     }
   }
 
@@ -72,10 +81,10 @@ trait Inlines {
     input.consumeTill(f"(?<!`)$opener(?!`)".r, true) match {
       case Some(code) =>
         // collapse internal spaces and append the inline code
-        block.append(Code(code.replaceAll("[ \t\r\n\f\u000b]{2,}", " ")))
+        block :+ Code(code.replaceAll("[ \t\r\n\f\u000b]{2,}", " "))
       case None =>
         // append literal backticks
-        block.append(Text(opener))
+        block :+ Text(opener)
     }
   }
 
@@ -116,18 +125,18 @@ trait Inlines {
     if (input.satisfy(email)) {
       // this is an email
       val mail = input.accept(email, group = 1)
-      block.append(Link(Seq(Text(mail)), f"mailto:$mail", None))
+      block :+ Link(Seq(Text(mail)), f"mailto:$mail", None)
     } else if (input.satisfy(absoluteUri)) {
       // this is an absolute URI
       val uri = input.accept(absoluteUri, group = 1)
-      block.append(Link(Seq(Text(uri)), uri, None))
+      block :+ Link(Seq(Text(uri)), uri, None)
     } else if (input.satisfy(htmlTag)) {
       // this is a raw html tag
       val tag = input.accept(htmlTag)
-      block.append(RawHtml(f"<$tag"))
+      block :+ RawHtml(f"<$tag")
     } else {
       // just a '<'
-      block.append(Text("&lt;"))
+      block :+ Text("&lt;")
     }
   }
 
@@ -141,78 +150,175 @@ trait Inlines {
     if (spaces.size >= 2 && isLineEnd) {
       // this is a hardbreak
       input.accept(lineEnding)
-      block.append(Hardbreak)
+      block :+ Hardbreak
     } else if (isLineEnd) {
       // this is a softbreak
       input.accept(lineEnding)
-      block.append(SoftBreak)
+      block :+ SoftBreak
     } else {
       // raw spaces
-      block.append(Text(spaces))
+      block :+ Text(spaces)
     }
   }
 
   private def parseNewLine(input: Input, block: Seq[Inline]): Seq[Inline] = {
     input.accept(lineEnding)
-    block.append(SoftBreak)
+    block :+ SoftBreak
   }
 
   // link, images and emphasis
+
+  private def encodeUri(input: String): String =
+    URLEncoder.encode(input, "UTF-8")
+      .replaceAll("\\+", "%20")
+      .replaceAll("%21", "!")
+      .replaceAll("%27", "'")
+      .replaceAll("%28", "(")
+      .replaceAll("%29", ")")
+      .replaceAll("%7E", "~")
+
+  private def decodeUri(input: String): String =
+    URLDecoder.decode(input.replaceAll("%20", "\\+")
+      .replaceAll("!", "%21")
+      .replaceAll("'", "%27")
+      .replaceAll("(", "%28")
+      .replaceAll(")", "%29")
+      .replaceAll("~", "%7E"), "UTF-8")
 
   private val unicodeWhitespace = """\p{IsWhite_Space}+"""
 
   private val unicodePunctuation = """[!"#$%&'()*+,\-./:;<=>?@\[\]\^_`{|}~\p{gc=Pc}\p{gc=Pd}\p{gc=Pe}\p{gc=Pf}\p{gc=Pi}\p{gc=Po}\p{gc=Ps}]"""
 
-  private sealed trait Delimiter {
-    def deactivate: Delimiter
-  }
-  private case class EmphToken(char: Char, length: Int, canOpen: Boolean, canClose: Boolean, node: Text) extends Delimiter {
-    val deactivate = this
-  }
-  private case class LinkOpener(isImage: Boolean, active: Boolean, node: Text) extends Delimiter {
-    def deactivate = copy(active = isImage)
+  private val linkLabel = f"^\\[((?:[^\\\\\\[\\]]|\\\\$escapable|\\\\){999})\\]".r
+
+  private def normalizeLinkLabel(label: String): String =
+    Normalizer.normalize(label, Normalizer.Form.NFC).toLowerCase(Locale.ENGLISH).replaceAll("\\s{2,}", " ")
+
+  private sealed abstract class Delimiter {
+
+    var previous: Option[Delimiter] = None
+    var next: Option[Delimiter] = None
+
+    def findLinkOpener: Option[LinkOpener]
+
+    def findPotentialCloserFrom: Option[EmphDelim]
+
+    // deactivate all the link openers before this node (inclusive) in the stack
+    def deactivateMeAndPrevious: Unit = {
+      deactivate
+      previous.foreach(_.deactivateMeAndPrevious)
+    }
+
+    // deactivate all the link openers before this node (exclusive) in the stack
+    def deactivatePrevious: Unit =
+      previous.foreach(_.deactivateMeAndPrevious)
+
+    var node: Text
+    def deactivate: Unit
   }
 
-  private sealed trait DelimiterStack {
-    def append(d: Delimiter): DelimiterStack
+  private case class EmphDelim(char: Char, length: Int, canOpen: Boolean, canClose: Boolean, var node: Text) extends Delimiter {
+    def findLinkOpener = previous.flatMap(_.findLinkOpener)
+    val findPotentialCloserFrom = Some(this)
+    def findPotentialOpenerFrom(bottom: Option[Delimiter]): Option[EmphDelim] = {
+      def loop(d: Delimiter): Option[EmphDelim] =
+        d match {
+          case e @ EmphDelim(`char`, olength, _, _, _) if olength + length % 3 != 0 => Some(e)
+          case _ => if (Some(d) == bottom) None else d.previous.flatMap(loop)
+        }
+      previous.flatMap(loop)
+    }
+    val deactivate = ()
   }
-  private case class DelimiterStackNode(delimiter: Delimiter) extends DelimiterStack {
-    private var previous: Option[DelimiterStack] = None
-    private var next: Option[DelimiterStack] = None
+  private case class LinkOpener(isImage: Boolean, var active: Boolean, var node: Text) extends Delimiter {
+    val findLinkOpener = Some(this)
+    def findPotentialCloserFrom = next.flatMap(_.findPotentialCloserFrom)
 
-    def append(d: Delimiter): DelimiterStack = {
-      val n = DelimiterStackNode(d)
-      next = Some(n)
-      n.previous = Some(this)
-      n
+    def deactivate =
+      active = isImage
+  }
+
+  private class DelimiterStack {
+
+    private var _top: Option[Delimiter] = None
+    private var _bottom: Option[Delimiter] = None
+
+    def top = _top
+    def bottom = _bottom
+
+    def push(d: Delimiter): Unit =
+      _top match {
+        case None =>
+          // stack is empty
+          val sd = Some(d)
+          _top = sd
+          _bottom = sd
+        case Some(t) =>
+          val sd = Some(d)
+          t.next = sd
+          d.previous = _top
+          _top = sd
+      }
+
+    def remove(node: Delimiter): Unit =
+      (node.previous, node.next) match {
+        case (sp @ Some(p), sn @ Some(n)) =>
+          // in the middle of the stack
+          p.next = sn
+          n.previous = sp
+        case (sp @ Some(p), None) =>
+          // on the top
+          p.next = None
+          _top = sp
+        case (None, sn @ Some(n)) =>
+          // in the bottom
+          n.previous = None
+          _bottom = sn
+        case (None, None) =>
+          // single element, empty everythin
+          _top = None
+          _bottom = None
+      }
+
+    def removeBetween(top: Delimiter, bottom: Delimiter): Unit = {
+      bottom.next = Some(top)
+      top.previous = Some(bottom)
+    }
+
+    def removeAbove(node: Delimiter): Unit = {
+      _top = Some(node)
+      node.next = None
+    }
+
+    def clear(): Unit = {
+      _top = None
+      _bottom = None
     }
 
   }
-  private case object EmptyDelimiterStack extends DelimiterStack {
-    def append(d: Delimiter): DelimiterStack =
-      DelimiterStackNode(d)
-  }
 
-  private def parseBang(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
+  private def parseBang(input: Input, block: Seq[Inline], stack: DelimiterStack): Seq[Inline] = {
     input.accept('!')
     input.peek match {
       case Some('[') =>
         // this is probably an image, try to parse it
         val node = Text("![")
-        (block :+ node, stack.append(LinkOpener(true, true, node)))
+        stack.push(LinkOpener(true, true, node))
+        block :+ node
       case Some(_) | None =>
         // ok, just a bang
-        (block.append(Text("!")), stack)
+        block :+ Text("!")
     }
   }
 
-  private def parseOpeningBracket(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
+  private def parseOpeningBracket(input: Input, block: Seq[Inline], stack: DelimiterStack): Seq[Inline] = {
     input.accept('[')
     val node = Text("[")
-    (block :+ node, stack.append(LinkOpener(false, true, node)))
+    stack.push(LinkOpener(false, true, node))
+    block :+ node
   }
 
-  private def parseStar(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
+  private def parseStar(input: Input, block: Seq[Inline], stack: DelimiterStack): Seq[Inline] = {
     val prev = input.previous
     val delim = input.accept("\\*+".r)
     val next = input.peek
@@ -229,10 +335,11 @@ trait Inlines {
     val canClose = rightFlanking
 
     val node = Text(delim)
-    (block :+ node, stack.append(EmphToken('*', delim.size, canOpen, canClose, node)))
+    stack.push(EmphDelim('*', delim.size, canOpen, canClose, node))
+    block :+ node
   }
 
-  private def parseUnderscore(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
+  private def parseUnderscore(input: Input, block: Seq[Inline], stack: DelimiterStack): Seq[Inline] = {
     val prev = input.previous
     val delim = input.accept("_+".r)
     val next = input.peek
@@ -249,38 +356,306 @@ trait Inlines {
     val canClose = rightFlanking && (!leftFlanking || nextIsPunctuation)
 
     val node = Text(delim)
-    (block :+ node, stack.append(EmphToken('_', delim.size, canOpen, canClose, node)))
+    stack.push(EmphDelim('_', delim.size, canOpen, canClose, node))
+    block :+ node
   }
 
-  private def lookForLinkOrImage(input: Input, block: Seq[Inline], stack: DelimiterStack): (Seq[Inline], DelimiterStack) = {
-    // look for active link opener in the stack
-    ???
+  private def lookForLinkOrImage(input: Input, references: Map[String, LinkReferenceDefinition], block: Seq[Inline], stack: DelimiterStack): Seq[Inline] = {
+    stack.top.flatMap(_.findLinkOpener) match {
+      case None =>
+        // link opener not found, return the raw "]" as text
+        block :+ Text("]")
+      case Some(node @ LinkOpener(_, false, _)) =>
+        // deactivated link opener found
+        // remove it from the stack
+        stack.remove(node)
+        block :+ Text("]")
+      case Some(node @ LinkOpener(isImage, true, _)) =>
+        parseLinkOrImage(input, references, block, isImage, node, stack)
+      case Some(_) =>
+        // error should never happen
+        throw new Exception("THIS IS A BUG! Please report with stack trace")
+    }
   }
+
+  private def parseLinkOrImage(input: Input, references: Map[String, LinkReferenceDefinition], block: Seq[Inline], isImage: Boolean, opener: Delimiter, stack: DelimiterStack): Seq[Inline] =
+    input.peek match {
+      case Some('(') =>
+        // try to parse an inline link or image
+        val inlined =
+          input.buffered {
+            // consume the opening parenthesis
+            input.next()
+            parseOptionalWhitespace(input)
+            val linkOrImage =
+              for {
+                dest <- parseLinkDestination(input)
+                () = parseOptionalWhitespace(input)
+                title <- parseOptionalTitle(input)
+                () = parseOptionalWhitespace(input)
+                ')' <- input.peek
+              } yield {
+                input.next()
+                // create the link with all inlines appearing after the opener
+                val (block1, inlines) = block.span(_ ne opener.node)
+                // head of inlines is the opener, drop it
+                val inlines1 = inlines.tail
+                // apply processEmphasis on these inlines
+                val inlines2 = processEmphasis(inlines1, Some(opener), stack)
+                // if this is not an image deactivate previous to avoid link in link
+                val link =
+                  if (isImage) {
+                    Image(inlines2, dest, title)
+                  } else {
+                    opener.deactivatePrevious
+                    Link(inlines2, dest, title)
+                  }
+                block1 :+ link
+              }
+            Action(linkOrImage)
+          }
+        inlined match {
+          case Some(block) =>
+            block
+          case None =>
+            input.next()
+            // try a shortcut reference
+            val (block1, inlines) = block.span(_ ne opener.node)
+            val inlines1 = inlines.tail
+            val label = normalizeLinkLabel(inlines1.map(_.toText).mkString)
+            references.get(label) match {
+              case Some(LinkReferenceDefinition(_, dest, title)) =>
+                val inlines2 = processEmphasis(inlines1, Some(opener), stack)
+                val link =
+                  if (isImage) {
+                    Image(inlines2, dest, title)
+                  } else {
+                    opener.deactivatePrevious
+                    Link(inlines2, dest, title)
+                  }
+                block1 :+ link
+              case None =>
+                stack.remove(opener)
+                block :+ Text("]")
+            }
+        }
+      case Some('[') =>
+        // try to parse a reference link or image
+        val reference =
+          input.buffered {
+            val label = normalizeLinkLabel(input.accept(linkLabel, group = 1))
+            if (label.isEmpty) {
+              // collapsed
+              val (block1, inlines) = block.span(_ ne opener.node)
+              val inlines1 = inlines.tail
+              val label1 = normalizeLinkLabel(inlines1.map(_.toText).mkString)
+              references.get(label1) match {
+                case Some(LinkReferenceDefinition(_, dest, title)) =>
+                  val inlines2 = processEmphasis(inlines1, Some(opener), stack)
+                  val link =
+                    if (isImage) {
+                      Image(inlines2, dest, title)
+                    } else {
+                      opener.deactivatePrevious
+                      Link(inlines2, dest, title)
+                    }
+                  Commit(block1 :+ link)
+                case None =>
+                  Rollback
+              }
+            } else {
+              // full
+              references.get(label) match {
+                case Some(LinkReferenceDefinition(_, dest, title)) =>
+                  val (block1, inlines) = block.span(_ ne opener.node)
+                  val inlines1 = inlines.tail
+                  val inlines2 = processEmphasis(inlines1, Some(opener), stack)
+                  val link =
+                    if (isImage) {
+                      Image(inlines2, dest, title)
+                    } else {
+                      opener.deactivatePrevious
+                      Link(inlines2, dest, title)
+                    }
+                  Commit(block1 :+ link)
+                case None =>
+                  Rollback
+              }
+            }
+          }
+        reference match {
+          case Some(block) =>
+            block
+          case None =>
+            stack.remove(opener)
+            block :+ Text("]")
+        }
+      case _ =>
+        // remove delimiter from stack and return raw "]"
+        stack.remove(opener)
+        block :+ Text("]")
+    }
+
+  private def processEmphasis(inlines: Seq[Inline], bottom: Option[Delimiter], stack: DelimiterStack): Seq[Inline] =
+    bottom.map(_.next).getOrElse(stack.bottom) match {
+      case Some(currentPosition) =>
+        def loop(inlines: Seq[Inline], currentPosition: Delimiter, starOpenerBottom: Option[Delimiter], underscoreOpenerBottom: Option[Delimiter]): Seq[Inline] = currentPosition.findPotentialCloserFrom match {
+          case Some(closer) =>
+            val bot = if (closer.char == '*') starOpenerBottom else underscoreOpenerBottom
+            closer.findPotentialOpenerFrom(bot) match {
+              case Some(opener) =>
+                val strong = closer.length >= 2 && opener.length >= 2
+                // take all between opener and closer in the inlines and emphasize them
+                val (beforeOpener, afterOpener) = inlines.span(_ ne opener.node)
+                val (beforeCloser, afterCloser) = afterOpener.span(_ ne closer.node)
+                (beforeCloser, afterCloser) match {
+                  case (Seq(_, content @ _*), Seq(_, rest @ _*)) =>
+                    if (strong) {
+                      // remove two characters from opener and closer
+                      opener.node = Text(opener.node.value.substring(2))
+                      closer.node = Text(opener.node.value.substring(2))
+                    } else {
+                      // remove one character from opener and closer
+                      opener.node = Text(opener.node.value.substring(1))
+                      closer.node = Text(opener.node.value.substring(1))
+                    }
+                    // remove delimiters between open and closer in the stack
+                    stack.removeBetween(closer, opener)
+                    (opener.node.value.size, closer.node.value.size) match {
+                      case (0, 0) =>
+                        // remove both from inlines they are empty
+                        val currentPosition1 = closer.next
+                        currentPosition1 match {
+                          case Some(pos) =>
+                            loop(beforeOpener ++ (Emphasis(strong, content) +: rest), pos, starOpenerBottom, underscoreOpenerBottom)
+                          case None =>
+                            // remove all delimiters above bottom in the stack
+                            bottom match {
+                              case Some(b) => stack.removeAbove(b)
+                              case None    => stack.clear
+                            }
+                            beforeOpener ++ (Emphasis(strong, content) +: rest)
+                        }
+                      case (0, _) =>
+                        // remove opener
+                        loop(beforeOpener ++ (Emphasis(strong, content) +: closer.node +: rest), currentPosition, starOpenerBottom, underscoreOpenerBottom)
+                      case (_, 0) =>
+                        // remove closer from inlines they are empty
+                        val currentPosition1 = closer.next
+                        currentPosition1 match {
+                          case Some(pos) =>
+                            loop(beforeOpener ++ (opener.node +: Emphasis(strong, content) +: rest), pos, starOpenerBottom, underscoreOpenerBottom)
+                          case None =>
+                            // remove all delimiters above bottom in the stack
+                            bottom match {
+                              case Some(b) => stack.removeAbove(b)
+                              case None    => stack.clear
+                            }
+                            beforeOpener ++ (opener.node +: Emphasis(strong, content) +: rest)
+                        }
+                      case (_, _) =>
+                        // keep both opener and closer
+                        loop(beforeOpener ++ (opener.node +: Emphasis(strong, content) +: closer.node +: rest), currentPosition, starOpenerBottom, underscoreOpenerBottom)
+                    }
+                  case (_, _) =>
+                    throw new Exception("THIS IS A BUG! Please report with a stack trace")
+                }
+              case None =>
+                ???
+            }
+          case None =>
+            // done
+            inlines
+        }
+        loop(inlines, currentPosition, bottom, bottom)
+      case None =>
+        // stack is empty, return inlines as is
+        inlines
+    }
+
+  private val whitespaceChar = " \t\r\n\f\u000b"
+  private val optionalWhitespace = f"(?:[$whitespaceChar])*".r
+
+  private def parseOptionalWhitespace(input: Input): Unit =
+    input.accept(optionalWhitespace)
+
+  private val linkDestinationBraces = f"^(?:[<]([^ <>\t\n\\\\\\x00]|\\\\$escapable|\\\\)*[>])".r
+
+  private def parseLinkDestination(input: Input): Option[String] =
+    if (input.satisfy(linkDestinationBraces)) {
+      val url = input.accept(linkDestinationBraces, group = 1)
+      Some(encodeUri(decodeUri(url)))
+    } else {
+      @tailrec
+      def loop(openedParen: Int, acc: StringBuilder): Option[String] =
+        input.peek match {
+          case None =>
+            None
+          case Some('\\') =>
+            acc.append(input.next())
+            if (input.hasNext)
+              acc.append(input.next())
+            loop(openedParen, acc)
+          case Some('(') =>
+            acc.append(input.next())
+            loop(openedParen + 1, acc)
+          case Some(')') =>
+            if (openedParen < 1) {
+              // this is the end
+              Some(acc.toString)
+            } else {
+              loop(openedParen - 1, acc.append(input.next()))
+            }
+          case Some(c) if whitespaceChar.contains(c) =>
+            Some(acc.toString)
+          case Some(_) =>
+            loop(openedParen, acc.append(input.next()))
+        }
+      loop(0, new StringBuilder).map(url => encodeUri(decodeUri(url)))
+    }
+
+  private val titleDoubleQuotes = f""""(\\\\$escapable|[^"\\x00])*"""".r
+  private val titleSimpleQuotes = f"""'(\\\\$escapable|[^'\\x00])*'""".r
+  private val titleParentheses = f"""\\((\\\\$escapable|[^)\\x00])*\\)""".r
+
+  private def parseOptionalTitle(input: Input): Option[Option[String]] =
+    input.peek match {
+      case Some('"') =>
+        Some(Some(input.accept(titleDoubleQuotes, group = 1)))
+      case Some('\'') =>
+        Some(Some(input.accept(titleSimpleQuotes, group = 1)))
+      case Some('(') =>
+        Some(Some(input.accept(titleParentheses, group = 1)))
+      case Some(_) =>
+        Some(None)
+      case None =>
+        None
+    }
 
   // entry point
 
   private val text = "[^ \r\n`\\[\\]\\!<&*_]+".r
 
-  private def parseInline(input: Input, block: Seq[Inline], stack: DelimiterStack): Option[(Seq[Inline], DelimiterStack)] =
+  private def parseInline(input: Input, references: Map[String, LinkReferenceDefinition], block: Seq[Inline], stack: DelimiterStack): Option[Seq[Inline]] =
     input.peek.map {
       case '\\' =>
-        parseBackslash(input, block) -> stack
+        parseBackslash(input, block)
       case '&' =>
-        parseAmp(input, block) -> stack
+        parseAmp(input, block)
       case '`' =>
-        parseBacktick(input, block) -> stack
+        parseBacktick(input, block)
       case '<' =>
-        parseLt(input, block) -> stack
+        parseLt(input, block)
       case ' ' =>
-        parseSpace(input, block) -> stack
+        parseSpace(input, block)
       case '\r' | '\n' =>
-        parseNewLine(input, block) -> stack
+        parseNewLine(input, block)
       case '!' =>
         parseBang(input, block, stack)
       case '[' =>
         parseOpeningBracket(input, block, stack)
       case ']' =>
-        lookForLinkOrImage(input, block, stack)
+        lookForLinkOrImage(input, references, block, stack)
       case '*' =>
         parseStar(input, block, stack)
       case '_' =>
@@ -288,17 +663,17 @@ trait Inlines {
       case _ =>
         // consume normal text
         val txt = input.accept(text)
-        block.append(Text(txt)) -> stack
+        block :+ Text(txt)
     }
 
-  def parseInlines(input: Input, block: Seq[Inline]): Seq[Inline] = {
+  def parseInlines(input: Input, references: Map[String, LinkReferenceDefinition]): Seq[Inline] = {
     @tailrec
     def loop(block: Seq[Inline], stack: DelimiterStack): Seq[Inline] =
-      parseInline(input, block, stack) match {
-        case Some((block, stack)) => loop(block, stack)
-        case None                 => block
+      parseInline(input, references, block, stack) match {
+        case Some(block) => loop(block, stack)
+        case None        => block
       }
-    loop(block, EmptyDelimiterStack)
+    loop(Seq.empty[Inline], new DelimiterStack)
   }
 
 }

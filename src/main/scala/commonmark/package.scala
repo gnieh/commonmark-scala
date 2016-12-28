@@ -15,18 +15,4 @@
 
 package object commonmark {
 
-  import ast._
-
-  implicit class InlinesOps(val inlines: Seq[Inline]) extends AnyVal {
-
-    def append(i: Inline): Seq[Inline] =
-      (i, inlines.lastOption) match {
-        case (Text(t1), Some(Text(t2))) =>
-          inlines.init :+ Text(t1 ++ t2)
-        case (_, _) =>
-          inlines :+ i
-      }
-
-  }
-
 }

@@ -66,7 +66,7 @@ final case class Quote(blocks: Seq[Block]) extends Block
  *  @see [[http://spec.commonmark.org/0.27/#list-marker]]
  *  @see [[http://spec.commonmark.org/0.27/#list]]
  */
-final case class List(tpe: ListType, tight: Boolean, items: Seq[Seq[Block]]) extends Block
+final case class Itemize(tpe: ListType, tight: Boolean, items: Seq[Seq[Block]]) extends Block
 
 sealed trait ListType
 
@@ -105,21 +105,8 @@ final case class Link(text: Seq[Inline], destination: String, title: Option[Stri
   def toText = text.foldLeft(new StringBuilder)((acc, in) => acc.append(in.toText)).toString
 }
 
-/** @see [[http://spec.commonmark.org/0.27/#full-reference-link]]
- *  @see [[http://spec.commonmark.org/0.27/#collapsed-reference-link]]
- *  @see [[http://spec.commonmark.org/0.27/#shortcut-reference-link]]
- */
-final case class ReferenceLink(text: Seq[Inline], label: String) extends Inline {
-  def toText = text.foldLeft(new StringBuilder)((acc, in) => acc.append(in.toText)).toString
-}
-
 /** @see [[http://spec.commonmark.org/0.27/#images]] */
 final case class Image(description: Seq[Inline], destination: String, title: Option[String]) extends Inline {
-  def toText = description.foldLeft(new StringBuilder)((acc, in) => acc.append(in.toText)).toString
-}
-
-/** @see [[http://spec.commonmark.org/0.27/#images]] */
-final case class ReferenceImage(description: Seq[Inline], label: String) extends Inline {
   def toText = description.foldLeft(new StringBuilder)((acc, in) => acc.append(in.toText)).toString
 }
 
