@@ -14,6 +14,8 @@
  */
 package commonmark.ast
 
+import java.net.URI
+
 final case class Doc(blocks: Seq[Block])
 
 /** @see [[http://spec.commonmark.org/0.27/#leaf-blocks]]
@@ -50,7 +52,7 @@ final case class HtmlBlock(content: String) extends Block
 /** @group LeafBlock
  *  @see [[http://spec.commonmark.org/0.27/#link-reference-definitions]]
  */
-final case class LinkReferenceDefinition(label: String, destination: String, title: Option[String]) extends Block
+final case class LinkReferenceDefinition(label: String, destination: URI, title: Option[String]) extends Block
 
 /** @group LeafBlock
  *  @see [[http://spec.commonmark.org/0.27/#paragraphs]]
@@ -101,12 +103,12 @@ final case class Emphasis(strong: Boolean, content: Seq[Inline]) extends Inline 
 /** @see [[http://spec.commonmark.org/0.27/#links]]
  *  @see [[http://spec.commonmark.org/0.27/#autolinks]]
  */
-final case class Link(text: Seq[Inline], destination: String, title: Option[String]) extends Inline {
+final case class Link(text: Seq[Inline], destination: URI, title: Option[String]) extends Inline {
   def toText = text.foldLeft(new StringBuilder)((acc, in) => acc.append(in.toText)).toString
 }
 
 /** @see [[http://spec.commonmark.org/0.27/#images]] */
-final case class Image(description: Seq[Inline], destination: String, title: Option[String]) extends Inline {
+final case class Image(description: Seq[Inline], destination: URI, title: Option[String]) extends Inline {
   def toText = description.foldLeft(new StringBuilder)((acc, in) => acc.append(in.toText)).toString
 }
 

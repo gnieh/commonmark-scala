@@ -18,10 +18,7 @@ import ast._
 
 import org.unbescape.html.HtmlEscape
 
-import java.net.{
-  URLEncoder,
-  URLDecoder
-}
+import java.net.URI
 import java.text.Normalizer
 import java.util.Locale
 
@@ -124,11 +121,11 @@ trait Inlines {
     if (input.satisfy(email)) {
       // this is an email
       val mail = input.accept(email, group = 1)
-      block :+ Link(Seq(Text(mail)), f"mailto:$mail", None)
+      block :+ Link(Seq(Text(mail)), new URI(f"mailto:$mail"), None)
     } else if (input.satisfy(absoluteUri)) {
       // this is an absolute URI
       val uri = input.accept(absoluteUri, group = 1)
-      block :+ Link(Seq(Text(uri)), uri, None)
+      block :+ Link(Seq(Text(uri)), new URI(uri), None)
     } else if (input.satisfy(htmlTag)) {
       // this is a raw html tag
       val tag = input.accept(htmlTag)
@@ -167,28 +164,11 @@ trait Inlines {
 
   // link, images and emphasis
 
-  private def encodeUri(input: String): String =
-    URLEncoder.encode(input, "UTF-8")
-      .replaceAll("\\+", "%20")
-      .replaceAll("%21", "!")
-      .replaceAll("%27", "'")
-      .replaceAll("%28", "(")
-      .replaceAll("%29", ")")
-      .replaceAll("%7E", "~")
-
-  private def decodeUri(input: String): String =
-    URLDecoder.decode(input.replaceAll("%20", "\\+")
-      .replaceAll("!", "%21")
-      .replaceAll("'", "%27")
-      .replaceAll("(", "%28")
-      .replaceAll(")", "%29")
-      .replaceAll("~", "%7E"), "UTF-8")
-
   private val unicodeWhitespace = """\p{IsWhite_Space}+"""
 
   private val unicodePunctuation = """[!"#$%&'()*+,\-./:;<=>?@\[\]\^_`{|}~\p{gc=Pc}\p{gc=Pd}\p{gc=Pe}\p{gc=Pf}\p{gc=Pi}\p{gc=Po}\p{gc=Ps}]"""
 
-  private val linkLabel = f"^\\[((?:[^\\\\\\[\\]]|\\\\$escapable|\\\\){999})\\]".r
+  private val linkLabel = f"^\\[((?:[^\\\\\\[\\]]|\\\\$escapable|\\\\){0,999})\\]".r
 
   private def normalizeLinkLabel(label: String): String =
     Normalizer.normalize(label, Normalizer.Form.NFC).toLowerCase(Locale.ENGLISH).replaceAll("\\s{2,}", " ")
@@ -365,13 +345,17 @@ trait Inlines {
     stack.top.flatMap(_.findLinkOpener) match {
       case None =>
         // link opener not found, return the raw "]" as text
+        input.next()
         block :+ Text("]")
       case Some(node @ LinkOpener(_, false, _)) =>
+        println("deactivated link opener")
         // deactivated link opener found
         // remove it from the stack
         stack.remove(node)
+        input.next()
         block :+ Text("]")
       case Some(node @ LinkOpener(isImage, true, _)) =>
+        input.next()
         parseLinkOrImage(input, references, block, isImage, node, stack)
       case Some(_) =>
         // error should never happen
@@ -419,7 +403,6 @@ trait Inlines {
           case Some(block) =>
             block
           case None =>
-            input.next()
             // try a shortcut reference
             val (block1, inlines) = block.span(_ ne opener.node)
             val inlines1 = inlines.tail
@@ -492,9 +475,26 @@ trait Inlines {
             block :+ Text("]")
         }
       case _ =>
-        // remove delimiter from stack and return raw "]"
-        stack.remove(opener)
-        block :+ Text("]")
+        // try shortcut
+        val (block1, inlines) = block.span(_ ne opener.node)
+        val inlines1 = inlines.tail
+        val label1 = normalizeLinkLabel(inlines1.map(_.toText).mkString)
+        references.get(label1) match {
+          case Some(LinkReferenceDefinition(_, dest, title)) =>
+            val inlines2 = processEmphasis(inlines1, Some(opener), stack)
+            val link =
+              if (isImage) {
+                Image(inlines2, dest, title)
+              } else {
+                opener.deactivatePrevious
+                Link(inlines2, dest, title)
+              }
+            block1 :+ link
+          case None =>
+            // remove delimiter from stack and return raw "]"
+            stack.remove(opener)
+            block :+ Text("]")
+        }
     }
 
   private def processEmphasis(inlines: Seq[Inline], bottom: Option[Delimiter], stack: DelimiterStack): Seq[Inline] =
@@ -514,11 +514,11 @@ trait Inlines {
                     if (strong) {
                       // remove two characters from opener and closer
                       opener.node = Text(opener.node.value.substring(2))
-                      closer.node = Text(opener.node.value.substring(2))
+                      closer.node = Text(closer.node.value.substring(2))
                     } else {
                       // remove one character from opener and closer
                       opener.node = Text(opener.node.value.substring(1))
-                      closer.node = Text(opener.node.value.substring(1))
+                      closer.node = Text(closer.node.value.substring(1))
                     }
                     // remove delimiters between open and closer in the stack
                     stack.removeBetween(closer, opener)
@@ -559,7 +559,12 @@ trait Inlines {
                         loop(beforeOpener ++ (opener.node +: Emphasis(strong, content) +: closer.node +: rest), currentPosition, starOpenerBottom, underscoreOpenerBottom)
                     }
                   case (_, _) =>
-                    throw new Exception("THIS IS A BUG! Please report with a stack trace")
+                    stack.remove(closer)
+                    bottom match {
+                      case Some(b) => stack.removeAbove(b)
+                      case None    => stack.clear
+                    }
+                    inlines
                 }
               case None =>
                 if (!closer.canOpen)
@@ -603,13 +608,13 @@ trait Inlines {
 
   private val linkDestinationBraces = f"^(?:[<]([^ <>\t\n\\\\\\x00]|\\\\$escapable|\\\\)*[>])".r
 
-  private def parseLinkDestination(input: StringScanner): Option[String] =
+  private def parseLinkDestination(input: StringScanner): Option[URI] =
     if (input.satisfy(linkDestinationBraces)) {
       val url = input.accept(linkDestinationBraces, group = 1)
-      Some(encodeUri(decodeUri(url)))
+      Some(new URI(url))
     } else {
       @tailrec
-      def loop(openedParen: Int, acc: StringBuilder): Option[String] =
+      def loop(openedParen: Int, acc: StringBuilder): Option[URI] =
         input.peek match {
           case None =>
             None
@@ -624,21 +629,21 @@ trait Inlines {
           case Some(')') =>
             if (openedParen < 1) {
               // this is the end
-              Some(acc.toString)
+              Some(new URI(acc.toString))
             } else {
               loop(openedParen - 1, acc.append(input.next()))
             }
           case Some(c) if whitespaceChar.contains(c) =>
-            Some(acc.toString)
+            Some(new URI(acc.toString))
           case Some(_) =>
             loop(openedParen, acc.append(input.next()))
         }
-      loop(0, new StringBuilder).map(url => encodeUri(decodeUri(url)))
+      loop(0, new StringBuilder)
     }
 
-  private val titleDoubleQuotes = f""""(\\\\$escapable|[^"\\x00])*"""".r
-  private val titleSimpleQuotes = f"""'(\\\\$escapable|[^'\\x00])*'""".r
-  private val titleParentheses = f"""\\((\\\\$escapable|[^)\\x00])*\\)""".r
+  private val titleDoubleQuotes = f""""((?:\\\\$escapable|[^"\\x00])*)"""".r
+  private val titleSimpleQuotes = f"""'((?:\\\\$escapable|[^'\\x00])*)'""".r
+  private val titleParentheses = f"""\\((?:(\\\\$escapable|[^)\\x00])*)\\)""".r
 
   private def parseOptionalTitle(input: StringScanner): Option[Option[String]] =
     input.peek match {
@@ -695,7 +700,8 @@ trait Inlines {
         case Some(block) => loop(block, stack)
         case None        => block
       }
-    loop(Seq.empty[Inline], new DelimiterStack)
+    val stack = new DelimiterStack
+    processEmphasis(loop(Seq.empty[Inline], stack), None, stack)
   }
 
 }
