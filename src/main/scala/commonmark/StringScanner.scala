@@ -14,7 +14,9 @@
  */
 package commonmark
 
+import scala.util.control.NonFatal
 import scala.util.matching.Regex
+import Regex.Match
 
 /** Abstract representation of an input to be parsed.
  *  It provides methods to easily access current
@@ -26,40 +28,69 @@ import scala.util.matching.Regex
  *  allowing to either commit or rollback the consumed input.
  *  It is handy when it is not easy to determine a priori whether
  *  the current input matches a construct using a regular expression.
- *  However be careful, for stream input, the more you buffer data, the more memory is potentially used.
  */
-trait Input {
+class StringScanner(input: String) {
+
+  private val size = input.size
+
+  private var pointers = List(0)
+
+  private def pointer = pointers.head
+
+  private def pointer_=(p: Int): Unit = {
+    val _ :: rest = pointers
+    pointers = p :: rest
+  }
 
   /** Returns the current character without consuming it.
    *
    *  @group NonConsuming
    */
-  def peek: Option[Char]
+  def peek: Option[Char] =
+    if (pointer >= size)
+      None
+    else
+      Some(input(pointer))
 
   /** Returns the last consumed character.
    *
    *  @group NonConsuming
    */
-  def previous: Option[Char]
+  def previous: Option[Char] =
+    if (pointer == 0)
+      None
+    else
+      Some(input(pointer - 1))
 
   /** Consumes the first character.
    *
    *  @group Consuming
    */
-  def next(): Char
+  def next(): Char =
+    if (hasNext) {
+      pointer += 1
+      input(pointer - 1)
+    } else {
+      throw new NoSuchElementException("EOS reached")
+    }
 
   /** Indicates whehter there is further characters in the input at the current position.
    *
    *  @group NonConsuming
    */
-  def hasNext: Boolean
+  def hasNext: Boolean =
+    pointer < size
 
   /* Checks that the current character is the given one
    * and consumes it.
    *
    * @group Consuming
     */
-  def accept(c: Char): Unit
+  def accept(c: Char): Unit =
+    if (hasNext && input(pointer) == c)
+      pointer += 1
+    else
+      throw new NoSuchElementException(f"Character $c expected")
 
   /* Checks that the input at the current position satsifies the regular expression
    * and consumes the matched prefix.
@@ -67,27 +98,65 @@ trait Input {
    *
    * @group Consuming
     */
-  def accept(re: Regex, group: Int = 0): String
+  def accept(re: Regex, group: Int = 0): String =
+    re.findFirstMatchIn(input.substring(pointer)) match {
+      case Some(m) if m.start == 0 =>
+        pointer += m.end
+        m.group(group)
+      case _ =>
+        throw new NoSuchElementException(f"Input does not respect expect regular expression $re")
+    }
 
   /* Indicates whether the input at the current position satsifies the regular expression
    * without consuming it.
    *
    * @group NonConsuming
     */
-  def satisfy(re: Regex): Boolean
+  def satisfy(re: Regex): Boolean =
+    re.findFirstMatchIn(input.substring(pointer)) match {
+      case Some(m) if m.start == 0 =>
+        true
+      case _ =>
+        false
+    }
 
   /** Consumes input from the current position
-   *  until the given regular expression matches and returns the (possibly empty)
+   *  until the given regular expression matches (inclusive) and returns the (possibly empty)
    *  matching string.
    *  If input ends before the closing regular expression matches, then returns `None` and consumes nothing.
-   *  If `inclusive` is `true`, then also consumes the matched closing string
-   *  (without returning it in any case).
    *
    *  @group Consuming
    */
-  def consumeTill(re: Regex, inclusive: Boolean): Option[String]
+  def consumeTill(re: Regex): Option[String] =
+    re.findFirstMatchIn(input.substring(pointer)) match {
+      case Some(m) =>
+        val res = input.substring(pointer, m.start + pointer)
+        pointer = m.end
+        Some(res)
+      case None =>
+        None
+    }
 
-  def buffered[T](f: => Action[T]): Option[T]
+  def buffered[T](f: => Action[T]): Option[T] = try {
+    pointers ::= pointer
+    f match {
+      case Commit(v) =>
+        // discard previous pointer
+        val p :: _ :: rest = pointers
+        // repush committed opinter
+        pointers = p :: rest
+        // return result
+        Some(v)
+      case Rollback =>
+        // just discard this pointer
+        pointers = pointers.tail
+        None
+    }
+  } catch {
+    case NonFatal(e) =>
+      pointers = pointers.tail
+      throw e
+  }
 
 }
 
